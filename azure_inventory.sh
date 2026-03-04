@@ -853,12 +853,12 @@ get_availability() {
       printf 'Regional\tN\tN\tExpressRoute circuit/port is regional'; return ;;
 
     microsoft.network/bastionhosts)
-      # Azure Bastion zone redundancy requires Standard (or higher) SKU with explicit zone assignment.
-      # Without zone config it is deployed regionally (no zone). Basic SKU has no AZ support.
-      # Ref: https://learn.microsoft.com/azure/bastion/bastion-overview#az
+      # Zone redundancy requires Standard or Premium SKU with explicit zone assignment.
+      # Developer and Basic SKUs have NO availability zone support.
+      # Ref: https://learn.microsoft.com/azure/bastion/configuration-settings#sku
       if   [[ "$zone_count" -ge 2 ]]; then printf 'Zone Redundant\tY\tN\tAzure Bastion zone-redundant (zones: %s)' "$zone_list"
       elif [[ "$zone_count" -eq 1 ]]; then printf 'Zonal - Zone %s\tY\tN\tAzure Bastion pinned to AZ %s' "$zone_list" "$zone_list"
-      elif [[ "$sku_l" == *"basic"* ]]; then printf 'Regional\tN\tN\tAzure Bastion Basic SKU -- no AZ support'
+      elif [[ "$sku_l" == *"basic"* || "$sku_l" == *"developer"* ]]; then printf 'Regional\tN\tN\tAzure Bastion %s SKU -- no AZ support' "$sku_name"
       else printf 'AZ Capable - Not Configured\tY\tY\tAzure Bastion Standard/Premium -- assign zones for zone redundancy'
       fi; return ;;
 
@@ -1109,8 +1109,11 @@ get_availability() {
         case "$sku_l" in
           *"p0v3"*|*"p1v3"*|*"p2v3"*|*"p3v3"*|*"p1mv3"*|*"p2mv3"*|*"p3mv3"*|*"p4mv3"*|*"p5mv3"*|\
           *"premiumv3"*|*"pv3"*|\
-          *"i1v2"*|*"i2v2"*|*"i3v2"*|*"i4v2"*|*"i5v2"*|*"i6v2"*|*"isolatedv2"*)
-            printf 'AZ Capable - Not Configured\tY\tY\tPremiumV3 or IsolatedV2 App Service Plan -- set zoneRedundant=true' ;;
+          *"i1v2"*|*"i2v2"*|*"i3v2"*|*"i4v2"*|*"i5v2"*|*"i6v2"*|*"isolatedv2"*|\
+          "ws1"|"ws2"|"ws3"|*"workflowstandard"*)
+            # WS1/WS2/WS3 = Logic Apps Standard (Workflow Standard) ASP SKUs — support zone redundancy.
+            # Ref: https://learn.microsoft.com/azure/logic-apps/set-up-zone-redundancy-availability-zones
+            printf 'AZ Capable - Not Configured\tY\tY\tPremiumV3 / IsolatedV2 / Workflow Standard App Service Plan -- set zoneRedundant=true' ;;
           *"consumption"*|*"dynamic"*|*"y1"*|"f1"|*"free"*|"d1"|*"shared"*|\
           "b1"|"b2"|"b3"|*"basic"*|"s1"|"s2"|"s3"|*"standard"*)
             printf 'Regional\tN\tN\tApp Service Plan SKU (%s) does not support zone redundancy' "$sku_name" ;;
@@ -1129,7 +1132,7 @@ get_availability() {
         printf 'Zone Redundant (Inherited)\tY\tN\tApp/Function App -- linked App Service Plan is zone-redundant'
       else
         case "$asp_sku_val" in
-          *p0v3*|*p1v3*|*p2v3*|*p3v3*|*p1mv3*|*p2mv3*|*p3mv3*|*p4mv3*|*p5mv3*|*premiumv3*|*pv3*|          *i1v2*|*i2v2*|*i3v2*|*i4v2*|*i5v2*|*i6v2*|*isolatedv2*)
+          *p0v3*|*p1v3*|*p2v3*|*p3v3*|*p1mv3*|*p2mv3*|*p3mv3*|*p4mv3*|*p5mv3*|*premiumv3*|*pv3*|          *i1v2*|*i2v2*|*i3v2*|*i4v2*|*i5v2*|*i6v2*|*isolatedv2*|          ws1|ws2|ws3|*workflowstandard*)
             printf 'AZ Capable - Not Configured\tY\tY\tApp/Function App -- linked ASP (%s) supports ZR but zoneRedundant=false' "$asp_sku_val" ;;
           *consumption*|*dynamic*|*y1*|f1|*free*|d1|*shared*|b1|b2|b3|*basic*|s1|s2|s3|*standard*)
             printf 'Regional\tN\tN\tApp/Function App -- linked ASP (%s) does not support zone redundancy' "$asp_sku_val" ;;
@@ -1295,7 +1298,16 @@ get_availability() {
           || printf 'Regional\tN\tN\tAPI Management non-Premium SKU -- no AZ support'
       fi; return ;;
 
-    microsoft.logic/*)         printf 'Zone Redundant\tY\tN\tLogic Apps (Standard) is automatically zone-redundant'; return ;;
+    microsoft.logic/workflows)
+      # microsoft.logic/workflows = Logic Apps CONSUMPTION tier (multi-tenant shared infrastructure).
+      # Consumption does NOT support zone redundancy.
+      # Logic Apps STANDARD (zone-redundant) runs as microsoft.web/sites (kind=workflowapp) on an ASP.
+      # Ref: https://learn.microsoft.com/azure/reliability/reliability-logic-apps
+      printf 'Regional\tN\tN\tLogic Apps Consumption -- multi-tenant shared infra, no zone redundancy support'; return ;;
+
+    microsoft.logic/*)
+      # Other Logic Apps subtypes (integration accounts, etc.) — regional resources.
+      printf 'Regional\tN\tN\tLogic Apps resource -- regional'; return ;;
     microsoft.communication/*) printf 'Regional\tN\tN\tAzure Communication Services -- regional'; return ;;
     microsoft.healthcareapis/*) printf 'Regional\tN\tN\tHealthcare APIs / FHIR -- regional'; return ;;
     microsoft.powerplatform/*) printf 'Regional\tN\tN\tPower Platform resource -- regional'; return ;;
@@ -1426,8 +1438,13 @@ get_availability() {
       printf 'Non-Regional\tN\tN\tAzure Policy resource -- global scope'; return ;;
     microsoft.costmanagement/*|microsoft.consumption/*|microsoft.billing/*|microsoft.costmanagementexports/*)
       printf 'Non-Regional\tN\tN\tCost Management resource -- global / non-regional'; return ;;
-    microsoft.resourcegraph/*|microsoft.resourcehealth/*|microsoft.portal/*|microsoft.features/*)
+    microsoft.resourcegraph/*|microsoft.resourcehealth/*|microsoft.features/*)
       printf 'Non-Regional\tN\tN\tARM platform resource -- global / non-regional'; return ;;
+
+    microsoft.portal/dashboards|microsoft.portal/*)
+      # Azure Portal dashboards are stored as regional ARM resources in the region where they're created.
+      # Ref: https://learn.microsoft.com/azure/azure-portal/azure-portal-dashboards
+      printf 'Regional\tN\tN\tAzure Portal Dashboard -- regional ARM resource'; return ;;
     microsoft.solutions/*|microsoft.customproviders/*)
       printf 'Regional\tN\tN\tManaged Application / Custom Provider -- regional'; return ;;
     microsoft.managedservices/*)
