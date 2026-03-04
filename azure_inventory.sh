@@ -120,7 +120,7 @@ RG_QUERY='resources
     propHAMode  = tostring(properties.highAvailability.mode),
     propRedund  = tostring(properties.redundancySettings.standardTierStorageRedundancy),
     propLBFEZones = iif(type =~ "microsoft.network/loadbalancers",
-                      tostring(properties.frontendIPConfigurations[0].zones),
+                      tostring(properties.frontendIPConfigurations),
                       ""),
     propGWSku     = iif(type =~ "microsoft.network/virtualnetworkgateways",
                       tostring(properties.sku.name),
@@ -615,10 +615,13 @@ get_availability() {
   # These must be handled by the type-specific cases below — skip the early exit.
   local loc_l="${location,,}"
   case "$type" in
-    # ALL microsoft.insights/* and microsoft.alertsmanagement/* types report
-    # location="global" in Resource Graph but are regional services in practice.
-    # Let them fall through to the type-specific classification blocks below.
-    microsoft.insights/*|microsoft.alertsmanagement/*)
+    # The following types report location="global" in Resource Graph but must be
+    # handled by their type-specific blocks below (not the generic global→Non-Regional exit).
+    #   - microsoft.insights/*: actually regional services despite global location tag
+    #   - microsoft.alertsmanagement/*: same
+    #   - microsoft.network/privatednszones*: genuinely global (handled as Non-Regional below)
+    #   - microsoft.network/dnszones: genuinely global (handled as Non-Regional below)
+    microsoft.insights/*|microsoft.alertsmanagement/*|    microsoft.network/privatednszones*|    microsoft.network/dnszones)
       : ;; # fall through to type-specific classification below
     *)
       case "$loc_l" in
@@ -706,12 +709,21 @@ get_availability() {
         printf 'Regional\tN\tN\tSnapshot stored with LRS -- single region, not zone-redundant'
       fi; return ;;
 
-    microsoft.compute/images|microsoft.compute/galleries|\
+    microsoft.compute/images)
+      # VM captured images are regional resources stored in a specific region.
+      # They can be replicated manually but the image itself is regional.
+      # Ref: https://learn.microsoft.com/azure/virtual-machines/capture-image-resource
+      printf 'Regional\tN\tN\tVM Captured Image -- regional resource; use Compute Gallery for zone-redundant image distribution'; return ;;
+
+    microsoft.compute/galleries|\
     microsoft.compute/galleries/images|\
     microsoft.compute/galleries/images/versions|\
     microsoft.compute/galleries/applications|\
     microsoft.compute/galleries/applications/versions)
-      printf 'Zone Redundant\tY\tN\tCompute Gallery replicates images across zones'; return ;;
+      # Azure Compute Gallery supports zone-redundant storage (ZRS) for image versions.
+      # The gallery and image definition resources are regional; versions can be replicated.
+      # Ref: https://learn.microsoft.com/azure/virtual-machines/azure-compute-gallery#high-availability
+      printf 'Zone Redundant\tY\tN\tCompute Gallery -- supports zone-redundant image version replication'; return ;;
 
     microsoft.compute/availabilitysets)
       printf 'Regional\tN\tN\tAvailability Sets provide rack-level redundancy only -- migrate to AZs'; return ;;
@@ -772,11 +784,16 @@ get_availability() {
       fi; return ;;
 
     microsoft.network/loadbalancers)
-      # Zone info lives on the frontend IP config, not the LB resource itself.
-      # lb_fe_zones is propLBFEZones from Resource Graph (frontendIPConfigurations[0].zones).
-      local fe_zone_count=0
+      # Zone redundancy for Standard LB lives on the frontend IP configurations, not the LB resource.
+      # propLBFEZones now contains the full frontendIPConfigurations JSON array.
+      # We find the maximum zone count across ALL frontend IPs.
+      # Ref: https://learn.microsoft.com/azure/load-balancer/load-balancer-standard-availability-zones
+      local fe_max_zones=0
       if [[ -n "$lb_fe_zones" && "$lb_fe_zones" != "null" && "$lb_fe_zones" != "[]" && "$lb_fe_zones" != '""' ]]; then
-        fe_zone_count=$(echo "$lb_fe_zones" | jq 'if type=="array" then length else (. | split(",") | length) end' 2>/dev/null || echo 0)
+        fe_max_zones=$(echo "$lb_fe_zones" | jq '
+          if type == "array" then
+            map(.zones // [] | length) | max // 0
+          else 0 end' 2>/dev/null || echo 0)
       fi
       if [[ "$sku_l" == "basic" ]]; then
         printf 'Regional\tN\tN\tBasic Load Balancer -- no AZ support (migrate to Standard)'
@@ -784,14 +801,14 @@ get_availability() {
         printf 'Zone Redundant\tY\tN\tStandard LB zone-redundant (zones: %s)' "$zone_list"
       elif [[ "$zone_count" -eq 1 ]]; then
         printf 'Zonal - Zone %s\tY\tN\tStandard LB pinned to zone %s' "$zone_list" "$zone_list"
-      elif [[ "$fe_zone_count" -ge 3 ]]; then
-        printf 'Zone Redundant\tY\tN\tStandard LB -- frontend IP is zone-redundant (all zones)'
-      elif [[ "$fe_zone_count" -eq 2 ]]; then
-        printf 'Zone Redundant\tY\tN\tStandard LB -- frontend IP spans %s zones' "$fe_zone_count"
-      elif [[ "$fe_zone_count" -eq 1 ]]; then
-        printf 'AZ Capable - Not Configured\tY\tY\tStandard LB -- frontend IP pinned to single zone (not zone-redundant)'
+      elif [[ "$fe_max_zones" -ge 3 ]]; then
+        printf 'Zone Redundant\tY\tN\tStandard LB -- all frontend IPs are zone-redundant (all 3 zones)'
+      elif [[ "$fe_max_zones" -eq 2 ]]; then
+        printf 'Zone Redundant\tY\tN\tStandard LB -- frontend IP(s) span 2 zones'
+      elif [[ "$fe_max_zones" -eq 1 ]]; then
+        printf 'AZ Capable - Not Configured\tY\tY\tStandard LB -- frontend IP pinned to single zone (not zone-redundant; needs all 3 zones)'
       else
-        printf 'AZ Capable - Not Configured\tY\tY\tStandard LB -- configure frontend IP zone assignment'
+        printf 'AZ Capable - Not Configured\tY\tY\tStandard LB -- no frontend zone assignment; configure zone-redundant frontend IPs'
       fi; return ;;
 
     microsoft.network/applicationgateways)
@@ -808,7 +825,11 @@ get_availability() {
       fi; return ;;
 
     microsoft.network/firewallpolicies)
-      printf 'Zone Redundant\tY\tN\tFirewall Policy is zone-redundant automatically'; return ;;
+      # Azure Firewall Policy is a regional control-plane configuration resource.
+      # Zone redundancy is configured on the Azure Firewall resource — not on the policy object.
+      # The policy can be shared across multiple firewalls in different zones.
+      # Ref: https://learn.microsoft.com/azure/firewall-manager/policy-overview
+      printf 'Regional\tN\tN\tFirewall Policy -- regional config resource; zone redundancy set on Firewall, not policy'; return ;;
 
     microsoft.network/virtualnetworkgateways)
       # VNet Gateways store SKU under properties.sku.name (not top-level sku.name).
@@ -832,14 +853,22 @@ get_availability() {
       printf 'Regional\tN\tN\tExpressRoute circuit/port is regional'; return ;;
 
     microsoft.network/bastionhosts)
+      # Azure Bastion zone redundancy requires Standard (or higher) SKU with explicit zone assignment.
+      # Without zone config it is deployed regionally (no zone). Basic SKU has no AZ support.
+      # Ref: https://learn.microsoft.com/azure/bastion/bastion-overview#az
       if   [[ "$zone_count" -ge 2 ]]; then printf 'Zone Redundant\tY\tN\tAzure Bastion zone-redundant (zones: %s)' "$zone_list"
       elif [[ "$zone_count" -eq 1 ]]; then printf 'Zonal - Zone %s\tY\tN\tAzure Bastion pinned to AZ %s' "$zone_list" "$zone_list"
-      else printf 'Zone Redundant\tY\tN\tAzure Bastion is automatically zone-redundant in AZ regions'
+      elif [[ "$sku_l" == *"basic"* ]]; then printf 'Regional\tN\tN\tAzure Bastion Basic SKU -- no AZ support'
+      else printf 'AZ Capable - Not Configured\tY\tY\tAzure Bastion Standard/Premium -- assign zones for zone redundancy'
       fi; return ;;
 
     microsoft.network/natgateways)
-      if [[ "$zone_count" -eq 1 ]]; then printf 'Zonal - Zone %s\tY\tN\tNAT Gateway pinned to AZ %s' "$zone_list" "$zone_list"
-      else printf 'Zonal Capable - Not Configured\tY\tY\tNAT Gateway must be assigned to a specific zone'
+      # NAT Gateway without a zone = "no zone" deployment = regional, resilient to zone failure by design.
+      # Zonal NAT Gateway pins to a specific zone (intentional choice for zone-affinity scenarios).
+      # A no-zone NAT Gateway is NOT a resiliency gap — it is the recommended non-zonal deployment.
+      # Ref: https://learn.microsoft.com/azure/nat-gateway/nat-availability-zones
+      if [[ "$zone_count" -eq 1 ]]; then printf 'Zonal - Zone %s\tY\tN\tNAT Gateway pinned to AZ %s (zonal by design)' "$zone_list" "$zone_list"
+      else printf 'Regional\tN\tN\tNAT Gateway -- no-zone deployment, regional and resilient to zone failures'
       fi; return ;;
 
     microsoft.network/virtualnetworks|\
@@ -869,16 +898,33 @@ get_availability() {
     microsoft.network/dnsresolvers/outboundendpoints|\
     microsoft.network/dnsforwardingrulesets|\
     microsoft.network/dnsforwardingrulesets/forwardingrules|\
-    microsoft.network/dnsforwardingrulesets/virtualnetworklinks|\
-    microsoft.network/dnszones|\
-    microsoft.network/privatednszones)
+    microsoft.network/dnsforwardingrulesets/virtualnetworklinks)
       # DNS Private Resolver (and its forwarding rulesets) is zone-redundant in AZ-enabled regions.
       # Ref: https://learn.microsoft.com/azure/dns/dns-private-resolver-reliability
       printf 'Zone Redundant\tY\tN\tDNS Private Resolver / Forwarding Ruleset is zone-redundant in AZ-enabled regions'; return ;;
 
-    microsoft.network/privatelinkservices|\
+    microsoft.network/privatednszones|\
+    microsoft.network/privatednszones/virtualnetworklinks)
+      # Azure Private DNS zones are global virtual resources — not tied to any specific Azure region.
+      # Ref: https://learn.microsoft.com/azure/dns/private-dns-overview
+      printf 'Non-Regional\tN\tN\tAzure Private DNS Zone -- global virtual resource, not region-specific'; return ;;
+
+    microsoft.network/dnszones)
+      # Azure Public DNS is a globally distributed service — not tied to any specific region.
+      # Ref: https://learn.microsoft.com/azure/dns/dns-overview
+      printf 'Non-Regional\tN\tN\tAzure Public DNS Zone -- globally distributed, non-regional service'; return ;;
+
     microsoft.network/privateendpoints)
-      printf 'Zone Redundant\tY\tN\tPrivate Link / Endpoint is automatically zone-redundant'; return ;;
+      # Private Endpoints create a NIC in a VNet subnet with a private IP.
+      # The NIC has no zone assignment — the endpoint is a regional resource.
+      # Ref: https://learn.microsoft.com/azure/private-link/private-endpoint-overview
+      printf 'Regional\tN\tN\tPrivate Endpoint -- regional resource, NIC has no zone assignment'; return ;;
+
+    microsoft.network/privatelinkservices)
+      # Private Link Service is attached to a Standard LB frontend IP.
+      # Its zone availability follows the LB frontend zone configuration, not automatic.
+      # Ref: https://learn.microsoft.com/azure/private-link/private-link-service-overview
+      printf 'Regional\tN\tN\tPrivate Link Service -- zone availability follows attached Standard LB frontend'; return ;;
 
     microsoft.network/virtualwans|microsoft.network/virtualhubs|\
     microsoft.network/vpngateways|microsoft.network/p2svpngateways|\
@@ -1040,7 +1086,13 @@ get_availability() {
       fi; return ;;
 
     microsoft.sqlvirtualmachine/*)
-      printf 'Zone Redundant\tY\tN\tSQL on VM -- AZ determined by underlying VM zone configuration'; return ;;
+      # SQL VM resource is a metadata/extension object on top of a VM.
+      # Zone redundancy follows the underlying VM zone assignment.
+      # Ref: https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/availability-group-overview
+      if [[ "$zone_count" -eq 1 ]]; then printf 'Zonal - Zone %s (Inherited)\tY\tN\tSQL on VM -- follows underlying VM in Zone %s' "$zone_list" "$zone_list"
+      elif [[ "$zone_count" -ge 2 ]]; then printf 'Zone Redundant (Inherited)\tY\tN\tSQL on VM -- underlying VM spans zones %s' "$zone_list"
+      else printf 'AZ Capable - Not Configured\tY\tY\tSQL on VM -- underlying VM has no zone assignment; deploy VM to an AZ'
+      fi; return ;;
 
     microsoft.azuredata/*)
       printf 'Regional\tN\tN\tAzure Arc SQL -- hosted on Arc-enabled infrastructure'; return ;;
@@ -1126,8 +1178,19 @@ get_availability() {
       else printf 'Zonal Capable - Not Configured\tY\tY\tContainer Instances support zonal deployment'
       fi; return ;;
 
+    microsoft.app/managedenvironments)
+      # Container Apps Environment zone redundancy must be explicitly enabled at creation time.
+      # It cannot be changed after deployment. propZR = properties.zoneRedundant
+      # Ref: https://learn.microsoft.com/azure/reliability/reliability-azure-container-apps
+      if [[ "$pzr_l" == "true" ]]; then printf 'Zone Redundant\tY\tN\tContainer Apps Environment -- zoneRedundant=true'
+      else printf 'AZ Capable - Not Configured\tY\tY\tContainer Apps Environment -- zoneRedundant=false; must be enabled at creation'
+      fi; return ;;
+
     microsoft.app/*)
-      printf 'Zone Redundant\tY\tN\tContainer Apps are automatically zone-redundant in AZ-enabled regions'; return ;;
+      # Container Apps (workloads) inherit zone redundancy from their managed environment.
+      # The app-level resource has no independent zone config.
+      # Ref: https://learn.microsoft.com/azure/reliability/reliability-azure-container-apps
+      printf 'Zone Redundant (Inherited)\tY\tN\tContainer App -- zone redundancy inherited from Container Apps Environment'; return ;;
 
     microsoft.redhatopenshift/openshiftclusters)
       if   [[ "$zone_count" -ge 2 ]]; then printf 'Zone Redundant\tY\tN\tARO cluster zone-redundant (zones: %s)' "$zone_list"
@@ -1162,7 +1225,11 @@ get_availability() {
   # ===========================================================================
   case "$type" in
     microsoft.datafactory/*)   printf 'Zone Redundant\tY\tN\tData Factory is automatically zone-redundant in AZ regions'; return ;;
-    microsoft.databricks/*)    printf 'Zone Redundant\tY\tN\tDatabricks is automatically zone-redundant in AZ regions'; return ;;
+    microsoft.databricks/*)
+      # Azure Databricks workspace reliability depends on the VNet and underlying VMSS zone configuration.
+      # Zone redundancy is NOT automatic — it requires VNet subnets and cluster node pools to span AZs.
+      # Ref: https://learn.microsoft.com/azure/reliability/reliability-databricks
+      printf 'AZ Capable - Not Configured\tY\tY\tAzure Databricks -- zone redundancy requires explicit VNet/subnet zone spanning configuration'; return ;;
 
     microsoft.kusto/*)
       if   [[ "$zone_count" -ge 2 ]]; then printf 'Zone Redundant\tY\tN\tData Explorer cluster zone-redundant (zones: %s)' "$zone_list"
@@ -1239,12 +1306,15 @@ get_availability() {
   # ===========================================================================
   case "$type" in
     microsoft.insights/components)
-      # Workspace-based App Insights inherits zone redundancy from its Log Analytics workspace.
-      # Classic (non-workspace) mode is regional.
+      # Workspace-based App Insights inherits zone redundancy from its linked Log Analytics workspace.
+      # Classic (non-workspace) mode is regional. Zone redundancy only applies when the workspace has ZR enabled.
+      # Ref: https://learn.microsoft.com/azure/azure-monitor/app/app-insights-overview#data-residency
       if [[ "$parent_info" == "workspace:classic" ]]; then
-        printf 'Regional\tN\tN\tApplication Insights (classic mode) -- no Log Analytics workspace, regional only'
+        printf 'Regional\tN\tN\tApplication Insights (classic mode) -- no linked Log Analytics workspace; regional only'
+      elif [[ "$parent_info" == "workspace:zr=true" ]]; then
+        printf 'Zone Redundant (Inherited)\tY\tN\tApplication Insights -- linked Log Analytics workspace has zone redundancy enabled'
       else
-        printf 'Zone Redundant (Inherited)\tY\tN\tApplication Insights -- workspace-based, inherits zone redundancy from linked Log Analytics workspace'
+        printf 'Regional\tN\tN\tApplication Insights -- linked workspace does not have zone redundancy enabled; enable ZR on the Log Analytics workspace'
       fi; return ;;
     # microsoft.insights/* sub-type breakdown
     # Ref: https://learn.microsoft.com/azure/reliability/reliability-monitoring-alerts
@@ -1287,7 +1357,16 @@ get_availability() {
   case "$type" in
     microsoft.cognitiveservices/*)       printf 'Zone Redundant\tY\tN\tAzure AI Services is zone-redundant in AZ-enabled regions'; return ;;
     microsoft.machinelearningservices/*) printf 'Zone Redundant\tY\tN\tAzure Machine Learning is zone-redundant in supported regions'; return ;;
-    microsoft.search/*)                  printf 'Zone Redundant\tY\tN\tAzure AI Search is zone-redundant (Standard and above in AZ regions)'; return ;;
+    microsoft.search/*)
+      # Azure AI Search zone redundancy requires Standard (or higher) SKU + 2 or more replicas
+      # explicitly distributed across zones. It is NOT automatic.
+      # Ref: https://learn.microsoft.com/azure/search/search-reliability#availability-zone-support
+      case "$sku_l" in
+        *"free"*|*"basic"*)
+          printf 'Regional\tN\tN\tAzure AI Search Free/Basic SKU -- no AZ support' ;;
+        *)
+          printf 'AZ Capable - Not Configured\tY\tY\tAzure AI Search -- deploy 2+ replicas across zones for zone redundancy' ;;
+      esac; return ;;
     microsoft.botservice/*|microsoft.autonomoussystems/*|microsoft.enterpriseknowledgegraph/*)
       printf 'Regional\tN\tN\tAI service -- regional'; return ;;
   esac
@@ -1307,7 +1386,22 @@ get_availability() {
   # BCDR
   # ===========================================================================
   case "$type" in
-    microsoft.recoveryservices/*) printf 'Zone Redundant\tY\tN\tRecovery Services Vault is zone-redundant in AZ regions'; return ;;
+    microsoft.recoveryservices/*)
+      # Recovery Services Vault redundancy depends on the storage redundancy setting.
+      # Ref: https://learn.microsoft.com/azure/backup/backup-create-recovery-services-vault#set-storage-redundancy
+      # propRedund = properties.redundancySettings.standardTierStorageRedundancy
+      # Values: ZoneRedundant | GeoRedundant | LocallyRedundant
+      local rsv_redund_l="${prop_redund,,}"
+      case "$rsv_redund_l" in
+        *"zoneredundant"*|*"zrs"*)
+          printf 'Zone Redundant\tY\tN\tRecovery Services Vault -- ZRS storage redundancy' ;;
+        *"georedundant"*|*"grs"*|*"georeplication"*)
+          printf 'Regional (Geo-Redundant)\tN\tY\tRecovery Services Vault -- GRS (geo-redundant, NOT zone-redundant); consider ZRS' ;;
+        *"locallyredundant"*|*"lrs"*)
+          printf 'AZ Capable - Not Configured\tY\tY\tRecovery Services Vault -- LRS (no geo/zone redundancy); upgrade to ZRS' ;;
+        *)
+          printf 'AZ Capable - Not Configured\tY\tY\tRecovery Services Vault -- redundancy not determined; verify storage redundancy setting' ;;
+      esac; return ;;
     microsoft.dataprotection/*)   printf 'Zone Redundant\tY\tN\tBackup Vault is zone-redundant in AZ regions'; return ;;
   esac
 
@@ -1460,8 +1554,10 @@ while IFS= read -r resource; do
       fi ;;
     microsoft.insights/components)
       WS_ID=$(echo "$APPINS_WS_MAP" | jq -r --arg id "$ID_L" '.[$id] // ""' 2>/dev/null || echo "")
-      if [[ -n "$WS_ID" && "$WS_ID" != "null" ]]; then
-        PARENT_INFO="workspace:linked"
+      if [[ -n "$WS_ID" && "$WS_ID" != "null" && "$WS_ID" != "" ]]; then
+        # Check if the linked workspace itself has zone redundancy enabled
+        WS_ZR=$(echo "$WS_INFO_MAP" | jq -r --arg id "$WS_ID" '.[$id].zr // false' 2>/dev/null || echo "false")
+        PARENT_INFO="workspace:zr=${WS_ZR}"
       else
         PARENT_INFO="workspace:classic"
       fi ;;
