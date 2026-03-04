@@ -615,7 +615,10 @@ get_availability() {
   # These must be handled by the type-specific cases below — skip the early exit.
   local loc_l="${location,,}"
   case "$type" in
-    microsoft.insights/components|    microsoft.insights/webtests|    microsoft.insights/scheduledqueryrules|    microsoft.insights/autoscalesettings)
+    # ALL microsoft.insights/* and microsoft.alertsmanagement/* types report
+    # location="global" in Resource Graph but are regional services in practice.
+    # Let them fall through to the type-specific classification blocks below.
+    microsoft.insights/*|microsoft.alertsmanagement/*)
       : ;; # fall through to type-specific classification below
     *)
       case "$loc_l" in
@@ -695,7 +698,13 @@ get_availability() {
       fi; return ;;
 
     microsoft.compute/snapshots)
-      printf 'Regional\tN\tN\tSnapshots are stored regionally'; return ;;
+      # Snapshots can be stored as ZRS (zone-redundant across zones) or LRS/regional.
+      # Ref: https://learn.microsoft.com/azure/virtual-machines/disks-redundancy#zone-redundant-storage-for-managed-disks
+      if [[ "$sku_l" == *"_zrs"* ]]; then
+        printf 'Zone Redundant\tY\tN\tSnapshot stored with ZRS -- zone-redundant across 3 AZs'
+      else
+        printf 'Regional\tN\tN\tSnapshot stored with LRS -- single region, not zone-redundant'
+      fi; return ;;
 
     microsoft.compute/images|microsoft.compute/galleries|\
     microsoft.compute/galleries/images|\
@@ -840,9 +849,17 @@ get_availability() {
     microsoft.network/routeservers|microsoft.network/virtualrouters)
       printf 'Zone Redundant\tY\tN\tRoute Server is automatically zone-redundant'; return ;;
 
-    microsoft.network/networkwatchers|\
+    microsoft.network/networkwatchers)
+      # Network Watcher is a regional control-plane tool (auto-created per region/subscription).
+      # It does not have an independent zone-redundancy configuration.
+      # Ref: https://learn.microsoft.com/azure/network-watcher/network-watcher-overview
+      printf 'Regional\tN\tN\tNetwork Watcher -- regional control-plane tool, no AZ configuration'; return ;;
+
+    microsoft.network/networkwatchers/flowlogs|\
     microsoft.network/networkwatchers/*)
-      printf 'Zone Redundant\tY\tN\tNetwork Watcher is automatically zone-redundant'; return ;;
+      # Flow logs are regional child resources of Network Watcher.
+      # Zone redundancy of the stored data depends on the configured storage account, not the flow log resource itself.
+      printf 'Regional\tN\tN\tNetwork Watcher flow log -- regional resource; storage ZR depends on target storage account'; return ;;
 
     microsoft.network/ddosprotectionplans)
       printf 'Zone Redundant\tY\tN\tDDoS Protection Standard is automatically zone-redundant'; return ;;
@@ -1229,7 +1246,33 @@ get_availability() {
       else
         printf 'Zone Redundant (Inherited)\tY\tN\tApplication Insights -- workspace-based, inherits zone redundancy from linked Log Analytics workspace'
       fi; return ;;
-    microsoft.insights/*)            printf 'Zone Redundant\tY\tN\tAzure Monitor resource -- zone-redundant in AZ-enabled regions'; return ;;
+    # microsoft.insights/* sub-type breakdown
+    # Ref: https://learn.microsoft.com/azure/reliability/reliability-monitoring-alerts
+    microsoft.insights/privatelinkscopes)
+      # Azure Monitor Private Link Scope (AMPLS) is a genuinely global resource —
+      # it defines connectivity scope across regions and has no regional placement.
+      # Ref: https://learn.microsoft.com/azure/azure-monitor/logs/private-link-security
+      printf 'Non-Regional\tN\tN\tAzure Monitor Private Link Scope -- global resource'; return ;;
+
+    microsoft.insights/actiongroups)
+      # Action Groups are regional; zone-redundant in regions that support AZs.
+      # Ref: https://learn.microsoft.com/azure/azure-monitor/alerts/action-groups#reliability
+      printf 'Zone Redundant\tY\tN\tAction Group -- zone-redundant in AZ-enabled regions'; return ;;
+    microsoft.insights/metricalerts|    microsoft.insights/scheduledqueryrules|    microsoft.insights/activitylogalerts|    microsoft.insights/webtests)
+      # Alert rules are stored regionally; not themselves zone-redundant resources
+      # (availability depends on Azure Monitor platform, not the rule resource itself).
+      # Ref: https://learn.microsoft.com/azure/azure-monitor/alerts/alerts-overview
+      printf 'Regional\tN\tN\tMonitor alert rule -- regional resource, availability backed by Azure Monitor platform'; return ;;
+    microsoft.insights/autoscalesettings)
+      # Autoscale settings are regional control-plane resources.
+      printf 'Regional\tN\tN\tAutoscale setting -- regional control-plane resource'; return ;;
+    microsoft.insights/workbooks|    microsoft.insights/workbooktemplates)
+      printf 'Regional\tN\tN\tAzure Monitor Workbook -- regional resource'; return ;;
+    microsoft.insights/datacollectionrules|    microsoft.insights/datacollectionendpoints)
+      # DCRs/DCEs are regional; zone redundancy not applicable.
+      printf 'Regional\tN\tN\tData Collection Rule/Endpoint -- regional resource'; return ;;
+    microsoft.insights/*)
+      printf 'Regional\tN\tN\tAzure Monitor resource -- regional (check specific type for ZR support)'; return ;;
     microsoft.operationalinsights/*) printf 'Zone Redundant\tY\tN\tLog Analytics Workspace is zone-redundant in AZ-enabled regions'; return ;;
     microsoft.monitor/*)             printf 'Zone Redundant\tY\tN\tAzure Monitor is zone-redundant in AZ-enabled regions'; return ;;
     microsoft.dashboard/*)           printf 'Zone Redundant\tY\tN\tManaged Grafana is automatically zone-redundant'; return ;;
@@ -1386,7 +1429,7 @@ while IFS= read -r resource; do
   RG=$(echo       "$resource" | jq -r '.resourceGroup    // ""')
   TYPE=$(echo     "$resource" | jq -r '.type             // ""')
   LOCATION=$(echo "$resource" | jq -r '.location         // ""')
-  TAGS=$(echo     "$resource" | jq -c '.tags             // {}')
+  TAGS=$(echo     "$resource" | jq -c '(.tags // {}) | with_entries(.value |= (tostring | gsub("^\\s+|\\s+$"; "")))')
   ZONES=$(echo    "$resource" | jq -c '.zonesArr         // []')
   SKU_N=$(echo    "$resource" | jq -r '.skuName          // ""')
   SKU_T=$(echo    "$resource" | jq -r '.skuTier          // ""')
