@@ -75,7 +75,6 @@ log_step()  { echo -e "\n${BLUE}${BOLD}---- $* ----${RESET}"; }
 # -- Arguments -----------------------------------------------------------------
 SUBSCRIPTION_ID="${1:-}"
 OUTPUT_FILE="${2:-azure_inventory_$(date +%Y%m%d_%H%M%S).csv}"
-SNIPPET_FILE="${OUTPUT_FILE%.csv}_unclassified_snippet.sh"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
@@ -119,12 +118,18 @@ RG_QUERY='resources
     propZR      = tostring(properties.zoneRedundant),
     propZRed    = tostring(properties.zoneRedundancy),
     propHAMode  = tostring(properties.highAvailability.mode),
-    propRedund  = tostring(properties.redundancySettings.standardTierStorageRedundancy)
+    propRedund  = tostring(properties.redundancySettings.standardTierStorageRedundancy),
+    propLBFEZones = iif(type =~ "microsoft.network/loadbalancers",
+                      tostring(properties.frontendIPConfigurations[0].zones),
+                      ""),
+    propGWSku     = iif(type =~ "microsoft.network/virtualnetworkgateways",
+                      tostring(properties.sku.name),
+                      "")
 | project
     id, name, resourceGroup, type, location, tags,
     zonesArr, skuName, skuTier, kindVal,
     extLoc, extLocName,
-    propZR, propZRed, propHAMode, propRedund'
+    propZR, propZRed, propHAMode, propRedund, propLBFEZones, propGWSku'
 
 SKIP=0
 PAGE_SIZE=1000
@@ -165,7 +170,7 @@ if [[ "$TOTAL" -eq 0 ]]; then
     -o json \
   | jq '[.[] | . + {
       zonesArr: (.zones // []), propZR: "", propZRed: "",
-      propHAMode: "", propRedund: "", extLoc: "", extLocName: ""
+      propHAMode: "", propRedund: "", extLoc: "", extLocName: "", propLBFEZones: "", propGWSku: ""
     }]' > "$WORK_DIR/all_resources.json"
   TOTAL=$(jq 'length' "$WORK_DIR/all_resources.json")
 else
@@ -215,6 +220,88 @@ jq 'reduce .[] as $r ({}; . + {($r.id | ascii_downcase): $r.anyZR})' \
   "$WORK_DIR/cosmos_zones.json" > "$WORK_DIR/cosmos_map.json" 2>/dev/null \
 || echo '{}' > "$WORK_DIR/cosmos_map.json"
 
+# -- Step 4: Parent-link sub-query (Web Apps → ASP, App Insights → Workspace, NICs → VM) ---
+log_step "Fetching parent-resource links (Web Apps / App Insights / NICs)"
+az graph query \
+  --subscriptions "$SUBSCRIPTION_ID" \
+  --graph-query '
+    resources
+    | where subscriptionId =~ "'"$SUBSCRIPTION_ID"'"
+    | where type in~ ("microsoft.web/sites",
+                      "microsoft.insights/components",
+                      "microsoft.network/networkinterfaces",
+                      "microsoft.compute/virtualmachines/extensions")
+    | extend parentId = case(
+        type =~ "microsoft.web/sites",
+          tolower(tostring(properties.serverFarmId)),
+        type =~ "microsoft.insights/components",
+          tolower(tostring(properties.WorkspaceResourceId)),
+        type =~ "microsoft.network/networkinterfaces",
+          tolower(tostring(properties.virtualMachine.id)),
+        type =~ "microsoft.compute/virtualmachines/extensions",
+          tolower(tostring(strcat_array(array_slice(split(id, "/"), 0, 9), "/"))),
+        "")
+    | project id, type, parentId' \
+  --output json --only-show-errors 2>/dev/null \
+| jq '[.data[] // empty]' > "$WORK_DIR/parent_links.json" 2>/dev/null \
+|| echo "[]" > "$WORK_DIR/parent_links.json"
+
+# Build per-type link maps from the parent_links query
+jq 'reduce .[] as $r ({};
+  if ($r.type | ascii_downcase) == "microsoft.web/sites"
+  then . + {($r.id | ascii_downcase): $r.parentId}
+  else . end)' "$WORK_DIR/parent_links.json" > "$WORK_DIR/webapp_asp_map.json" 2>/dev/null \
+|| echo "{}" > "$WORK_DIR/webapp_asp_map.json"
+
+jq 'reduce .[] as $r ({};
+  if ($r.type | ascii_downcase) == "microsoft.insights/components"
+  then . + {($r.id | ascii_downcase): $r.parentId}
+  else . end)' "$WORK_DIR/parent_links.json" > "$WORK_DIR/appinsights_ws_map.json" 2>/dev/null \
+|| echo "{}" > "$WORK_DIR/appinsights_ws_map.json"
+
+jq 'reduce .[] as $r ({};
+  if ($r.type | ascii_downcase) == "microsoft.network/networkinterfaces"
+  then . + {($r.id | ascii_downcase): $r.parentId}
+  else . end)' "$WORK_DIR/parent_links.json" > "$WORK_DIR/nic_vm_map.json" 2>/dev/null \
+|| echo "{}" > "$WORK_DIR/nic_vm_map.json"
+
+# VM Extensions also resolve to their parent VM via the same vm_zone_map
+jq 'reduce .[] as $r ({};
+  if ($r.type | ascii_downcase) == "microsoft.compute/virtualmachines/extensions"
+  then . + {($r.id | ascii_downcase): $r.parentId}
+  else . end)' "$WORK_DIR/parent_links.json" > "$WORK_DIR/vmext_vm_map.json" 2>/dev/null \
+|| echo "{}" > "$WORK_DIR/vmext_vm_map.json"
+
+# Build parent-property lookup maps from already-fetched all_resources.json (no extra API calls)
+# ASP ZR map: asp_id → "zr" | "capable" | "regional"
+jq 'reduce .[] as $r ({};
+  if ($r.type | ascii_downcase) == "microsoft.web/serverfarms"
+  then
+    . + {($r.id | ascii_downcase): {
+      zr:  ($r.propZR == "true"),
+      sku: ($r.skuName // "" | ascii_downcase)
+    }}
+  else . end)' "$WORK_DIR/all_resources.json" > "$WORK_DIR/asp_info_map.json" 2>/dev/null \
+|| echo "{}" > "$WORK_DIR/asp_info_map.json"
+
+# Workspace info map: workspace_id → {location, zr}
+jq 'reduce .[] as $r ({};
+  if ($r.type | ascii_downcase) == "microsoft.operationalinsights/workspaces"
+  then
+    . + {($r.id | ascii_downcase): {
+      location: $r.location,
+      zr:       ($r.propZR == "true")
+    }}
+  else . end)' "$WORK_DIR/all_resources.json" > "$WORK_DIR/workspace_info_map.json" 2>/dev/null \
+|| echo "{}" > "$WORK_DIR/workspace_info_map.json"
+
+# VM zone map: vm_id → zones array (e.g. ["1"])
+jq 'reduce .[] as $r ({};
+  if ($r.type | ascii_downcase) == "microsoft.compute/virtualmachines"
+  then . + {($r.id | ascii_downcase): ($r.zonesArr // [])}
+  else . end)' "$WORK_DIR/all_resources.json" > "$WORK_DIR/vm_zone_map.json" 2>/dev/null \
+|| echo "{}" > "$WORK_DIR/vm_zone_map.json"
+
 log_ok "Sub-queries complete."
 
 # -- Helpers -------------------------------------------------------------------
@@ -231,7 +318,9 @@ get_group_type() {
     microsoft.compute)
       case "$t" in
         *virtualmachinescalesets*) echo "Compute - VMSS" ;;
+        *virtualmachines/extensions*) echo "Compute - Virtual Machines" ;;
         *virtualmachines*)         echo "Compute - Virtual Machines" ;;
+        *sshpublickeys*)           echo "Compute" ;;
         *disks*)                   echo "Compute - Managed Disks" ;;
         *snapshots*)               echo "Compute - Snapshots" ;;
         *images*|*galleries*)      echo "Compute - Compute Gallery / Images" ;;
@@ -492,6 +581,9 @@ get_availability() {
   local prop_redund="${10:-}"
   local aks_zones="${11:-[]}"
   local cosmos_zr="${12:-0}"
+  local lb_fe_zones="${13:-}"   # zones from LB frontend IP configuration
+  local gw_sku="${14:-}"         # properties.sku.name for VNet Gateways
+  local parent_info="${15:-}"    # parent-resource context: asp/workspace/vm link
 
   [[ "$prop_zr"      == "null" ]] && prop_zr=""
   [[ "$prop_zred"    == "null" ]] && prop_zred=""
@@ -518,10 +610,18 @@ get_availability() {
   fi
 
   # Non-Regional by location name
+  # Some resource types falsely report location="global" in Resource Graph but are
+  # actually regional (data residency follows a linked workspace / config).
+  # These must be handled by the type-specific cases below — skip the early exit.
   local loc_l="${location,,}"
-  case "$loc_l" in
-    global|"")
-      printf 'Non-Regional\tN\tN\tService is global / non-regional'; return ;;
+  case "$type" in
+    microsoft.insights/components|    microsoft.insights/webtests|    microsoft.insights/scheduledqueryrules|    microsoft.insights/autoscalesettings)
+      : ;; # fall through to type-specific classification below
+    *)
+      case "$loc_l" in
+        global|"")
+          printf 'Non-Regional\tN\tN\tService is global / non-regional'; return ;;
+      esac ;;
   esac
 
   # Non-Regional by resource type
@@ -550,6 +650,29 @@ get_availability() {
       if   [[ "$zone_count" -eq 1 ]]; then printf 'Zonal - Zone %s\tY\tN\tVM pinned to availability zone %s' "$zone_list" "$zone_list"
       elif [[ "$zone_count" -ge 2 ]]; then printf 'Zonal - Zones %s\tY\tN\tVM spans multiple zones -- use VMSS for zone-resilient compute' "$zone_list"
       else printf 'AZ Capable - Not Configured\tY\tY\tVM has no zone assignment -- critical resiliency gap'
+      fi; return ;;
+
+    microsoft.compute/sshpublickeys)
+      # SSH Public Keys are metadata-only resources (stored key pairs).
+      # No zone concept — purely a control-plane object scoped to a region.
+      # Ref: https://learn.microsoft.com/azure/virtual-machines/ssh-keys-azure-cli
+      printf 'Regional\tN\tN\tSSH Public Key is a metadata-only resource -- no zone assignment'; return ;;
+
+    microsoft.compute/virtualmachines/extensions)
+      # VM Extensions are child resources — their availability is determined entirely
+      # by the parent VM's zone placement.
+      # parent_info = "vm:zones=["1"]" resolved via parent-link sub-query
+      if [[ "$parent_info" == vm:zones=* ]]; then
+        local ext_vm_zones ext_vm_zc ext_vm_zl
+        ext_vm_zones=$(echo "$parent_info" | sed 's/vm:zones=//')
+        ext_vm_zc=$(echo "$ext_vm_zones" | jq 'length' 2>/dev/null || echo 0)
+        ext_vm_zl=$(echo "$ext_vm_zones" | jq -r 'join(", ")' 2>/dev/null || echo "")
+        if   [[ "$ext_vm_zc" -eq 1 ]]; then printf 'Zonal - Zone %s (Inherited)\tY\tN\tVM Extension follows parent VM in Zone %s' "$ext_vm_zl" "$ext_vm_zl"
+        elif [[ "$ext_vm_zc" -ge 2 ]]; then printf 'Zone Redundant (Inherited)\tY\tN\tVM Extension follows parent VM spanning zones %s' "$ext_vm_zl"
+        else printf 'Regional\tN\tN\tVM Extension follows parent VM -- parent VM has no zone assignment'
+        fi
+      else
+        printf 'Regional\tN\tN\tVM Extension -- parent VM zone unknown or VM has no zone'
       fi; return ;;
 
     microsoft.compute/virtualmachinescalesets)
@@ -640,10 +763,26 @@ get_availability() {
       fi; return ;;
 
     microsoft.network/loadbalancers)
-      if [[ "$sku_l" == "basic" ]]; then printf 'Regional\tN\tN\tBasic Load Balancer -- no AZ support (migrate to Standard)'
-      elif [[ "$zone_count" -ge 2 ]]; then printf 'Zone Redundant\tY\tN\tStandard LB zone-redundant (zones: %s)' "$zone_list"
-      elif [[ "$zone_count" -eq 1 ]]; then printf 'Zonal - Zone %s\tY\tN\tStandard LB pinned to zone %s' "$zone_list" "$zone_list"
-      else printf 'AZ Capable - Not Configured\tY\tY\tStandard LB -- configure frontend IP zone assignment'
+      # Zone info lives on the frontend IP config, not the LB resource itself.
+      # lb_fe_zones is propLBFEZones from Resource Graph (frontendIPConfigurations[0].zones).
+      local fe_zone_count=0
+      if [[ -n "$lb_fe_zones" && "$lb_fe_zones" != "null" && "$lb_fe_zones" != "[]" && "$lb_fe_zones" != '""' ]]; then
+        fe_zone_count=$(echo "$lb_fe_zones" | jq 'if type=="array" then length else (. | split(",") | length) end' 2>/dev/null || echo 0)
+      fi
+      if [[ "$sku_l" == "basic" ]]; then
+        printf 'Regional\tN\tN\tBasic Load Balancer -- no AZ support (migrate to Standard)'
+      elif [[ "$zone_count" -ge 2 ]]; then
+        printf 'Zone Redundant\tY\tN\tStandard LB zone-redundant (zones: %s)' "$zone_list"
+      elif [[ "$zone_count" -eq 1 ]]; then
+        printf 'Zonal - Zone %s\tY\tN\tStandard LB pinned to zone %s' "$zone_list" "$zone_list"
+      elif [[ "$fe_zone_count" -ge 3 ]]; then
+        printf 'Zone Redundant\tY\tN\tStandard LB -- frontend IP is zone-redundant (all zones)'
+      elif [[ "$fe_zone_count" -eq 2 ]]; then
+        printf 'Zone Redundant\tY\tN\tStandard LB -- frontend IP spans %s zones' "$fe_zone_count"
+      elif [[ "$fe_zone_count" -eq 1 ]]; then
+        printf 'AZ Capable - Not Configured\tY\tY\tStandard LB -- frontend IP pinned to single zone (not zone-redundant)'
+      else
+        printf 'AZ Capable - Not Configured\tY\tY\tStandard LB -- configure frontend IP zone assignment'
       fi; return ;;
 
     microsoft.network/applicationgateways)
@@ -663,7 +802,11 @@ get_availability() {
       printf 'Zone Redundant\tY\tN\tFirewall Policy is zone-redundant automatically'; return ;;
 
     microsoft.network/virtualnetworkgateways)
-      if   [[ "$sku_l" == *"az"* ]]; then printf 'Zone Redundant\tY\tN\tVPN/ER Gateway using AZ SKU (%s)' "$sku_name"
+      # VNet Gateways store SKU under properties.sku.name (not top-level sku.name).
+      # Use gw_sku (propGWSku) as fallback when sku_l is empty.
+      local eff_gw_sku_l="${sku_l:-${gw_sku,,}}"
+      local eff_gw_sku_display="${sku_name:-$gw_sku}"
+      if   [[ "$eff_gw_sku_l" == *"az"* ]]; then printf 'Zone Redundant\tY\tN\tVPN/ER Gateway using AZ SKU (%s)' "$eff_gw_sku_display"
       elif [[ "$zone_count" -ge 2 ]]; then printf 'Zone Redundant\tY\tN\tVNet Gateway spans zones: %s' "$zone_list"
       else printf 'AZ Capable - Not Configured\tY\tY\tUse AZ SKU (e.g. VpnGw1AZ / ErGw1AZ) for zone redundancy'
       fi; return ;;
@@ -707,9 +850,14 @@ get_availability() {
     microsoft.network/dnsresolvers|\
     microsoft.network/dnsresolvers/inboundendpoints|\
     microsoft.network/dnsresolvers/outboundendpoints|\
+    microsoft.network/dnsforwardingrulesets|\
+    microsoft.network/dnsforwardingrulesets/forwardingrules|\
+    microsoft.network/dnsforwardingrulesets/virtualnetworklinks|\
     microsoft.network/dnszones|\
     microsoft.network/privatednszones)
-      printf 'Zone Redundant\tY\tN\tDNS Private Resolver / Zones are zone-redundant'; return ;;
+      # DNS Private Resolver (and its forwarding rulesets) is zone-redundant in AZ-enabled regions.
+      # Ref: https://learn.microsoft.com/azure/dns/dns-private-resolver-reliability
+      printf 'Zone Redundant\tY\tN\tDNS Private Resolver / Forwarding Ruleset is zone-redundant in AZ-enabled regions'; return ;;
 
     microsoft.network/privatelinkservices|\
     microsoft.network/privateendpoints)
@@ -735,13 +883,30 @@ get_availability() {
     microsoft.network/networksecuritygroups|\
     microsoft.network/networksecuritygroups/securityrules|\
     microsoft.network/routetables|\
-    microsoft.network/networkinterfaces|\
     microsoft.network/localnetworkgateways|\
     microsoft.network/connections|\
     microsoft.network/ipgroups|\
     microsoft.network/applicationsecuritygroups|\
     microsoft.network/servicetags)
       printf 'Regional\tN\tN\tNetwork control plane resource -- no direct AZ assignment'; return ;;
+
+    microsoft.network/networkinterfaces)
+      # NICs do not have their own zone assignment — they follow the attached VM.
+      # parent_info = "vm:zones=["1"]"  or empty if unattached
+      if [[ "$parent_info" == vm:zones=* ]]; then
+        local nic_vm_zones
+        nic_vm_zones=$(echo "$parent_info" | sed 's/vm:zones=//')
+        local nic_vm_zc
+        nic_vm_zc=$(echo "$nic_vm_zones" | jq 'length' 2>/dev/null || echo 0)
+        local nic_vm_zl
+        nic_vm_zl=$(echo "$nic_vm_zones" | jq -r 'join(", ")' 2>/dev/null || echo "")
+        if   [[ "$nic_vm_zc" -eq 1 ]]; then printf 'Zonal - Zone %s (Inherited)\tY\tN\tNIC follows attached VM in Zone %s' "$nic_vm_zl" "$nic_vm_zl"
+        elif [[ "$nic_vm_zc" -ge 2 ]]; then printf 'Zone Redundant (Inherited)\tY\tN\tNIC follows attached VM spanning zones %s' "$nic_vm_zl"
+        else printf 'Regional\tN\tN\tNIC attached to non-zonal VM'
+        fi
+      else
+        printf 'Regional\tN\tN\tNIC not attached to a VM (unassigned or PaaS-managed)'
+      fi; return ;;
 
     microsoft.peering/*)
       printf 'Regional\tN\tN\tAzure Peering Service -- regional resource'; return ;;
@@ -886,7 +1051,25 @@ get_availability() {
       fi; return ;;
 
     microsoft.web/sites|microsoft.web/sites/slots)
-      printf 'Zone Redundant (Inherited)\tY\tN\tApp/Function App inherits zone redundancy from its App Service Plan'; return ;;
+      # Availability is driven by the linked App Service Plan.
+      # parent_info = "asp:zr=true/false:sku=<sku>"
+      local asp_zr_val asp_sku_val
+      asp_zr_val=$(echo "$parent_info" | sed 's/.*zr=\([^:]*\).*/\1/')
+      asp_sku_val=$(echo "$parent_info" | sed 's/.*sku=\(.*\)/\1/')
+      if [[ "$asp_zr_val" == "true" ]]; then
+        printf 'Zone Redundant (Inherited)\tY\tN\tApp/Function App -- linked App Service Plan is zone-redundant'
+      else
+        case "$asp_sku_val" in
+          *p0v3*|*p1v3*|*p2v3*|*p3v3*|*p1mv3*|*p2mv3*|*p3mv3*|*p4mv3*|*p5mv3*|*premiumv3*|*pv3*|          *i1v2*|*i2v2*|*i3v2*|*i4v2*|*i5v2*|*i6v2*|*isolatedv2*)
+            printf 'AZ Capable - Not Configured\tY\tY\tApp/Function App -- linked ASP (%s) supports ZR but zoneRedundant=false' "$asp_sku_val" ;;
+          *consumption*|*dynamic*|*y1*|f1|*free*|d1|*shared*|b1|b2|b3|*basic*|s1|s2|s3|*standard*)
+            printf 'Regional\tN\tN\tApp/Function App -- linked ASP (%s) does not support zone redundancy' "$asp_sku_val" ;;
+          "")
+            printf 'Zone Redundant (Inherited)\tY\tN\tApp/Function App -- ASP link not resolved (assume inherited)' ;;
+          *)
+            printf 'AZ Capable - Not Configured\tY\tY\tApp/Function App -- check if linked ASP (%s) supports zone redundancy' "$asp_sku_val" ;;
+        esac
+      fi; return ;;
 
     microsoft.web/hostingenvironments)
       if   [[ "$pzr_l" == "true" ]];  then printf 'Zone Redundant\tY\tN\tApp Service Environment v3 zoneRedundant=true'
@@ -1038,7 +1221,15 @@ get_availability() {
   # MONITORING
   # ===========================================================================
   case "$type" in
-    microsoft.insights/*)            printf 'Zone Redundant\tY\tN\tApplication Insights / Azure Monitor resource -- zone-redundant'; return ;;
+    microsoft.insights/components)
+      # Workspace-based App Insights inherits zone redundancy from its Log Analytics workspace.
+      # Classic (non-workspace) mode is regional.
+      if [[ "$parent_info" == "workspace:classic" ]]; then
+        printf 'Regional\tN\tN\tApplication Insights (classic mode) -- no Log Analytics workspace, regional only'
+      else
+        printf 'Zone Redundant (Inherited)\tY\tN\tApplication Insights -- workspace-based, inherits zone redundancy from linked Log Analytics workspace'
+      fi; return ;;
+    microsoft.insights/*)            printf 'Zone Redundant\tY\tN\tAzure Monitor resource -- zone-redundant in AZ-enabled regions'; return ;;
     microsoft.operationalinsights/*) printf 'Zone Redundant\tY\tN\tLog Analytics Workspace is zone-redundant in AZ-enabled regions'; return ;;
     microsoft.monitor/*)             printf 'Zone Redundant\tY\tN\tAzure Monitor is zone-redundant in AZ-enabled regions'; return ;;
     microsoft.dashboard/*)           printf 'Zone Redundant\tY\tN\tManaged Grafana is automatically zone-redundant'; return ;;
@@ -1151,7 +1342,7 @@ get_availability() {
   # The resource is written to the CSV with UNCLASSIFIED in the Availability
   # Configuration column and "?" in AZ Capable / Resiliency Gap so it clearly
   # stands out.  After all normal rows the CSV includes a summary section with
-  # all unique unclassified types and a companion snippet file is generated.
+  # all unique unclassified types with a ready-to-paste case snippet per row.
   # ===========================================================================
   if   [[ "$zone_count" -ge 2 ]]; then
     printf 'UNCLASSIFIED (zones hint: Zone Redundant)\t?\t?\tNot mapped in script. zones[] field suggests ZR (%s). Add case for: %s' "$zone_list" "$type"
@@ -1167,8 +1358,15 @@ log_step "Generating CSV output"
 
 echo "Subscription,Subscription ID,Resource Group,Resource Name,Resource ID,Resource Type,Provider Namespace,Group Type,Service Category,SKU Name,SKU Tier,Location,Tags,Availability Configuration,Zones (raw),AZ Capable (Y/N),Resiliency Gap (Y/N),Notes" > "$OUTPUT_FILE"
 
-AKS_MAP=$(cat "$WORK_DIR/aks_map.json")
-COSMOS_MAP=$(cat "$WORK_DIR/cosmos_map.json")
+AKS_MAP=$(cat          "$WORK_DIR/aks_map.json")
+COSMOS_MAP=$(cat       "$WORK_DIR/cosmos_map.json")
+WEBAPP_ASP_MAP=$(cat   "$WORK_DIR/webapp_asp_map.json")
+APPINS_WS_MAP=$(cat    "$WORK_DIR/appinsights_ws_map.json")
+NIC_VM_MAP=$(cat       "$WORK_DIR/nic_vm_map.json")
+VMEXT_VM_MAP=$(cat    "$WORK_DIR/vmext_vm_map.json")
+ASP_INFO_MAP=$(cat     "$WORK_DIR/asp_info_map.json")
+WS_INFO_MAP=$(cat      "$WORK_DIR/workspace_info_map.json")
+VM_ZONE_MAP=$(cat      "$WORK_DIR/vm_zone_map.json")
 
 # Track UNCLASSIFIED types: associative arrays keyed by exact type string
 declare -A UC_COUNT    # how many instances found
@@ -1197,6 +1395,8 @@ while IFS= read -r resource; do
   PZRED=$(echo    "$resource" | jq -r '.propZRed         // ""')
   PHA=$(echo      "$resource" | jq -r '.propHAMode       // ""')
   PRED=$(echo     "$resource" | jq -r '.propRedund       // ""')
+  PLB_FE_ZONES=$(echo "$resource" | jq -r '.propLBFEZones // ""')
+  PGW_SKU=$(echo      "$resource" | jq -r '.propGWSku     // ""')
 
   TYPE_L="${TYPE,,}"
   NS=$(cut -d'/' -f1 <<< "$TYPE_L")
@@ -1204,12 +1404,44 @@ while IFS= read -r resource; do
   AKS_Z=$(echo "$AKS_MAP"    | jq -r --arg id "${ID,,}" '.[$id] // ""' 2>/dev/null || echo "")
   COSM=$(echo  "$COSMOS_MAP" | jq -r --arg id "${ID,,}" '.[$id] // "0"' 2>/dev/null || echo "0")
 
+  # -- Parent-resource lookup (Web Apps, App Insights, NICs) -------------------
+  PARENT_INFO=""
+  ID_L="${ID,,}"
+  case "$TYPE_L" in
+    microsoft.web/sites|microsoft.web/sites/slots)
+      ASP_ID=$(echo "$WEBAPP_ASP_MAP" | jq -r --arg id "$ID_L" '.[$id] // ""' 2>/dev/null || echo "")
+      if [[ -n "$ASP_ID" ]]; then
+        ASP_ZR=$(echo  "$ASP_INFO_MAP" | jq -r --arg id "$ASP_ID" '.[$id].zr  // false' 2>/dev/null || echo "false")
+        ASP_SKU=$(echo "$ASP_INFO_MAP" | jq -r --arg id "$ASP_ID" '.[$id].sku // ""'    2>/dev/null || echo "")
+        PARENT_INFO="asp:zr=${ASP_ZR}:sku=${ASP_SKU}"
+      fi ;;
+    microsoft.insights/components)
+      WS_ID=$(echo "$APPINS_WS_MAP" | jq -r --arg id "$ID_L" '.[$id] // ""' 2>/dev/null || echo "")
+      if [[ -n "$WS_ID" && "$WS_ID" != "null" ]]; then
+        PARENT_INFO="workspace:linked"
+      else
+        PARENT_INFO="workspace:classic"
+      fi ;;
+    microsoft.network/networkinterfaces)
+      VM_ID=$(echo "$NIC_VM_MAP" | jq -r --arg id "$ID_L" '.[$id] // ""' 2>/dev/null || echo "")
+      if [[ -n "$VM_ID" && "$VM_ID" != "null" ]]; then
+        VM_ZONES=$(echo "$VM_ZONE_MAP" | jq -c --arg id "$VM_ID" '.[$id] // []' 2>/dev/null || echo "[]")
+        PARENT_INFO="vm:zones=${VM_ZONES}"
+      fi ;;
+    microsoft.compute/virtualmachines/extensions)
+      VMEXT_PARENT=$(echo "$VMEXT_VM_MAP" | jq -r --arg id "$ID_L" '.[$id] // ""' 2>/dev/null || echo "")
+      if [[ -n "$VMEXT_PARENT" && "$VMEXT_PARENT" != "null" ]]; then
+        VM_ZONES=$(echo "$VM_ZONE_MAP" | jq -c --arg id "$VMEXT_PARENT" '.[$id] // []' 2>/dev/null || echo "[]")
+        PARENT_INFO="vm:zones=${VM_ZONES}"
+      fi ;;
+  esac
+
   GROUP=$(get_group_type "$TYPE_L")
   SCAT=$(get_service_category "$TYPE_L")
 
   RAW=$(get_availability \
     "$TYPE_L" "$ZONES" "$LOCATION" "$SKU_N" "$SKU_T" \
-    "$PZR" "$PZRED" "$PHA" "$EXT_L" "$PRED" "$AKS_Z" "$COSM")
+    "$PZR" "$PZRED" "$PHA" "$EXT_L" "$PRED" "$AKS_Z" "$COSM" "$PLB_FE_ZONES" "$PGW_SKU" "$PARENT_INFO")
 
   AVAIL=$(printf '%s' "$RAW" | cut -f1)
   AZCAP=$(printf '%s' "$RAW" | cut -f2)
@@ -1298,54 +1530,6 @@ if [[ "${#UNCLASSIFIED_TYPES[@]}" -gt 0 ]]; then
       >> "$OUTPUT_FILE"
   done <<< "$SORTED_UC"
 
-  log_step "Writing companion snippet file: ${SNIPPET_FILE}"
-  {
-    printf '#!/usr/bin/env bash\n'
-    printf '# =================================================================\n'
-    printf '# UNCLASSIFIED TYPE SNIPPETS — azure_inventory.sh companion file\n'
-    printf '# Generated : %s\n' "$(date -u '+%%Y-%%m-%%dT%%H:%%M:%%SZ')"
-    printf '# Sub       : %s (%s)\n' "$SUBSCRIPTION_NAME" "$SUBSCRIPTION_ID"
-    printf '#\n'
-    printf '# HOW TO USE\n'
-    printf '#  1. Look up each type at:\n'
-    printf '#     https://learn.microsoft.com/azure/reliability/availability-zones-service-support\n'
-    printf '#  2. Replace Regional/TODO with the correct Availability Config value.\n'
-    printf '#  3. Paste each case block into get_availability() BEFORE the\n'
-    printf '#     "UNCLASSIFIED FALLBACK" comment block.\n'
-    printf '#  4. Optionally add the type to get_group_type() for a friendly label.\n'
-    printf '#  5. Re-run the inventory — the type will no longer appear here.\n'
-    printf '#\n'
-    printf '# AVAILABILITY CONFIG OPTIONS (pick one)\n'
-    printf '#   Zone Redundant                  Spans multiple AZs automatically\n'
-    printf '#   Zone Redundant + Geo            ZRS + Geo redundancy\n'
-    printf '#   Zone Redundant (Inherited)      Inherits ZR from parent resource\n'
-    printf '#   Zonal - Zone N                  Pinned to a single zone\n'
-    printf '#   Zonal - Same Zone HA            HA standby in same zone (not ZR)\n'
-    printf '#   AZ Capable - Not Configured     Supports AZ but not using it\n'
-    printf '#   Zonal Capable - Not Configured  Supports zonal pinning but not set\n'
-    printf '#   Regional (Geo-Redundant)        Geo-redundant but not zone-redundant\n'
-    printf '#   Regional                        No AZ support\n'
-    printf '#   Non-Regional                    Global / non-regional service\n'
-    printf '# =================================================================\n\n'
-    printf '# Paste each block into get_availability() in azure_inventory.sh\n\n'
-
-    while IFS=$'\t' read -r CNT TYPE_KEY; do
-      [[ -z "$TYPE_KEY" ]] && continue
-      TL="${TYPE_KEY,,}"
-      printf '  # ── %s\n' "$TYPE_KEY"
-      printf '  #    Instances : %s\n' "$CNT"
-      printf '  #    Location  : %s\n' "${UC_EX_LOC[$TYPE_KEY]:-unknown}"
-      printf '  #    Example   : %s / %s\n' "${UC_EX_RG[$TYPE_KEY]:-}" "${UC_EX_NAME[$TYPE_KEY]:-}"
-      printf '  #    SKU       : %s\n' "${UC_EX_SKU[$TYPE_KEY]:-n/a}"
-      printf '  #    Hint      : %s\n' "${UC_HINT[$TYPE_KEY]}"
-      printf '  #    Docs      : https://learn.microsoft.com/azure/templates/%s\n' "${TL//\//-}"
-      printf '  #\n'
-      printf '    %s)\n' "$TL"
-      printf "      printf 'Regional\\\\tN\\\\tN\\\\tTODO: classify %s'; return ;;\n\n" "$TYPE_KEY"
-    done <<< "$SORTED_UC"
-  } > "$SNIPPET_FILE"
-  chmod +x "$SNIPPET_FILE"
-  log_ok "Snippet file written: ${BOLD}${SNIPPET_FILE}${RESET}"
 
 else
   log_ok "No UNCLASSIFIED entries — all resource types are mapped in the script."
@@ -1357,7 +1541,6 @@ echo -e "${BOLD}${GREEN}========================================================
 echo -e "${BOLD}  Azure Resource Inventory -- Complete${RESET}"
 echo -e "${BOLD}${GREEN}==========================================================${RESET}"
 log_ok "Output CSV    : ${BOLD}${OUTPUT_FILE}${RESET}"
-[[ "${#UNCLASSIFIED_TYPES[@]}" -gt 0 ]] && log_ok "Snippet file  : ${BOLD}${SNIPPET_FILE}${RESET}"
 log_ok "Total rows    : ${BOLD}${COUNT}${RESET}   |   Errors: ${ERRORS}"
 echo ""
 
@@ -1396,7 +1579,6 @@ if [[ "${#UNCLASSIFIED_TYPES[@]}" -gt 0 ]]; then
     printf "  %-65s %d instance(s)\n" "$TYPE_KEY" "${UC_COUNT[$TYPE_KEY]}"
   done
   echo ""
-  echo -e "  ${YELLOW}${BOLD}Next step:${RESET}${YELLOW} open ${BOLD}${SNIPPET_FILE}${RESET}${YELLOW} for ready-to-paste case blocks.${RESET}"
   echo ""
 fi
 
